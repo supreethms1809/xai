@@ -1505,6 +1505,10 @@ def train_dynamic_anchors(
     else:
         plt.close(fig)
 
+    # save policy network and value network
+    torch.save(policy.state_dict(), f'policy_{args.dataset}_{args.episodes}_{args.steps}_{args.classifier_epochs}_{args.reg_lambda}_{args.seed}_{args.device}_{args.use_perturbation}_{args.perturbation_mode}_{args.n_perturb}_{args.local_instance_index}_{args.initial_window}_{args.show_plots}_{args.max_features_in_rule}.pth')
+    torch.save(value_fn.state_dict(), f'value_fn_{args.dataset}_{args.episodes}_{args.steps}_{args.classifier_epochs}_{args.reg_lambda}_{args.seed}_{args.device}_{args.use_perturbation}_{args.perturbation_mode}_{args.n_perturb}_{args.local_instance_index}_{args.initial_window}_{args.show_plots}_{args.max_features_in_rule}.pth')
+
     return {
         "episode_returns": episode_rewards,
         "test_accuracy": test_acc_history,
@@ -1545,7 +1549,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    train_dynamic_anchors(
+    results = train_dynamic_anchors(
         dataset=args.dataset,
         episodes=args.episodes,
         steps_per_episode=args.steps,
@@ -1559,6 +1563,14 @@ if __name__ == "__main__":
         local_instance_index=args.local_instance_index,
         initial_window=args.initial_window,
         show_plots=args.show_plots,
+        max_features_in_rule=args.max_features_in_rule,
     )
+
+    import json
+
+    # save results to json
+    with open(f'results_{args.dataset}_{args.episodes}_{args.steps}_{args.classifier_epochs}_{args.reg_lambda}_{args.seed}_{args.device}_{args.use_perturbation}_{args.perturbation_mode}_{args.n_perturb}_{args.local_instance_index}_{args.initial_window}_{args.show_plots}_{args.max_features_in_rule}.json', 'w') as f:
+        json.dump(results, f, indent=4)
+    print(f"Results saved to results_{args.dataset}_{args.episodes}_{args.steps}_{args.classifier_epochs}_{args.reg_lambda}_{args.seed}_{args.device}_{args.use_perturbation}_{args.perturbation_mode}_{args.n_perturb}_{args.local_instance_index}_{args.initial_window}_{args.show_plots}_{args.max_features_in_rule}.json")
 
 
