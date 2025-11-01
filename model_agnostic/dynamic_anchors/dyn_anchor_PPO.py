@@ -417,16 +417,30 @@ class DiscreteAnchorEnv(AnchorEnv):
             x_star_unit=(x_star_bins.astype(np.float32) if x_star_bins is not None else None),
             initial_window=0.0,
         )
-        # Initialize discrete bounds in integer bin indices
+        # Normalize bin indices to [0, 1] for consistency with continuous mode
+        # Store max bins for each feature to enable normalization/de-normalization
+        self.max_bins_per_feature = np.array([float(self._max_bin(j)) for j in range(self.n_features)], dtype=np.float32)
+        # Avoid division by zero
+        self.max_bins_per_feature = np.maximum(self.max_bins_per_feature, 1.0)
+        
+        # Initialize discrete bounds normalized to [0, 1] (like continuous mode)
+        # lower = 0.0 (first bin), upper = 1.0 (last bin) after normalization
         self.lower = np.zeros(self.n_features, dtype=np.float32)
-        self.upper = np.array([self._max_bin(j) for j in range(self.n_features)], dtype=np.float32)
+        self.upper = np.ones(self.n_features, dtype=np.float32)
+        
+        # Store raw bin indices for mask comparison (since X_unit has raw bin indices)
+        self.lower_bins = np.zeros(self.n_features, dtype=np.float32)
+        self.upper_bins = self.max_bins_per_feature.copy()
+        
         # Use integer step bins instead of proportional steps (conservative moves)
         self.step_bins = (1, 1, 1)
-        # Per-feature minimum width in bins (>= 2 bins or 10% of range)
+        # Per-feature minimum width in normalized [0, 1] space (>= 2 bins or 10% of range)
         self.min_width_bins = np.zeros(self.n_features, dtype=np.float32)
         for j in range(self.n_features):
-            maxb = float(self._max_bin(j)) + 1.0
-            self.min_width_bins[j] = max(2.0, np.ceil(0.10 * maxb))
+            maxb = self.max_bins_per_feature[j] + 1.0
+            min_bins = max(2.0, np.ceil(0.10 * maxb))
+            # Normalize to [0, 1]
+            self.min_width_bins[j] = min_bins / maxb if maxb > 0 else 0.1
 
     def _max_bin(self, j: int) -> int:
         return int(max(0, self.X_bins[:, j].max()))
@@ -534,6 +548,10 @@ def train_dynamic_anchors(
     num_greedy_rollouts: int = 1,
     num_test_instances_per_class: int | None = None,
     max_features_in_rule: int = 5,
+    # PPO-specific parameters
+    ppo_epochs: int = 4,
+    clip_epsilon: float = 0.2,
+    batch_size: int | None = None,
 ):
     """
     Train dynamic anchors using RL and classifier co-training.
@@ -610,6 +628,9 @@ def train_dynamic_anchors(
             "drift_penalty_weight": 0.05,
             "js_penalty_weight": 0.05,
             "disc_perc": [25, 50, 75],
+            # PPO params
+            "ppo_epochs": 4,
+            "clip_epsilon": 0.2,
         },
         "synthetic": {
             "episodes": 30,
@@ -630,6 +651,9 @@ def train_dynamic_anchors(
             "drift_penalty_weight": 0.05,
             "js_penalty_weight": 0.05,
             "disc_perc": [20, 40, 60, 80],
+            # PPO params
+            "ppo_epochs": 4,
+            "clip_epsilon": 0.2,
         },
         "covtype": {
             "episodes": 60,
@@ -650,6 +674,9 @@ def train_dynamic_anchors(
             "drift_penalty_weight": 0.05,
             "js_penalty_weight": 0.05,
             "disc_perc": [10, 25, 50, 75, 90],
+            # PPO params
+            "ppo_epochs": 4,
+            "clip_epsilon": 0.2,
         },
     }
     p = presets[dataset]
@@ -677,6 +704,15 @@ def train_dynamic_anchors(
             p["coverage_target"] = float(coverage_target)
         except Exception:
             pass
+    
+    # Resolve PPO parameters
+    ppo_epochs = int(ppo_epochs if ppo_epochs is not None else p.get("ppo_epochs", 4))
+    clip_epsilon = float(clip_epsilon if clip_epsilon is not None else p.get("clip_epsilon", 0.2))
+    # Batch size: if None, use all collected experiences (no batching)
+    if batch_size is None:
+        batch_size = None  # Will use all experiences
+    else:
+        batch_size = int(batch_size)
 
     # Log classes and feature names together
     print("*****************")
@@ -689,7 +725,9 @@ def train_dynamic_anchors(
     if use_discretization:
         disc_vals = (disc_perc if disc_perc is not None else p['disc_perc'])
         disc_info = f", disc_perc={disc_vals}"
-    print(f"[auto] using dataset-specific defaults: episodes={episodes}, steps={steps_per_episode}, clf_epochs={classifier_epochs_per_round}, use_perturbation={use_perturbation}, mode={perturbation_mode}, n_perturb={n_perturb}, initial_window={initial_window}, precision_target={p['precision_target']}, coverage_target={p['coverage_target']}{disc_info}")
+    ppo_info = f", ppo_epochs={ppo_epochs}, clip_epsilon={clip_epsilon}"
+    batch_info = f", batch_size={batch_size}" if batch_size is not None else ""
+    print(f"[auto] using dataset-specific defaults: episodes={episodes}, steps={steps_per_episode}, clf_epochs={classifier_epochs_per_round}, use_perturbation={use_perturbation}, mode={perturbation_mode}, n_perturb={n_perturb}, initial_window={initial_window}, precision_target={p['precision_target']}, coverage_target={p['coverage_target']}{disc_info}{ppo_info}{batch_info}")
 
     # Split before scaling to avoid leakage
     X_train_raw, X_test_raw, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=seed, stratify=y)
@@ -880,12 +918,22 @@ def train_dynamic_anchors(
         acc = evaluate_classifier()
         test_acc_history.append(acc)
 
-        # 2) RL loop adjusting anchor boxes per class using current classifier
+        # 2) PPO: Collect experiences from all classes first
         episode_drifts = []
         episode_prec_cov = []
         total_return = 0.0
         # Track reward component sums for this episode (across classes)
         comp_sums = {"prec_gain": 0.0, "cov_gain": 0.0, "overlap_pen": 0.0, "drift_pen": 0.0, "js_pen": 0.0}
+        
+        # PPO: Collect experiences from all classes first
+        all_states = []
+        all_actions = []
+        all_old_log_probs = []
+        all_rewards = []
+        all_values = []
+        all_dones = []
+        all_entropies = []
+        gamma = 0.99
 
         for cls, env in envs.items():
             state = env.reset()
@@ -899,31 +947,41 @@ def train_dynamic_anchors(
             if debug:
                 # Suppress reset-time metric printing to avoid confusion
                 pass
-            log_probs = []
-            values = []
-            rewards = []
-            entropies = []
-            gamma = 0.99
+            
+            class_states = []
+            class_actions = []
+            class_old_log_probs = []
+            class_rewards = []
+            class_values = []
+            class_dones = []
+            class_entropies = []
             info = {}  # ensure defined if no steps
+            
             for t in range(steps_per_episode):
                 classifier.eval()
                 s = torch.from_numpy(state).float().to(device)
-                logits = policy(s)
-                probs_pi = torch.softmax(logits, dim=-1)
-                dist = torch.distributions.Categorical(probs_pi)
-                action = dist.sample()
-                log_prob = dist.log_prob(action)
-                value = value_fn(s)
+                with torch.no_grad():
+                    logits = policy(s)
+                    probs_pi = torch.softmax(logits, dim=-1)
+                    dist = torch.distributions.Categorical(probs_pi)
+                    action = dist.sample()
+                    log_prob = dist.log_prob(action)
+                    value = value_fn(s)
 
                 next_state, reward, done, info = env.step(int(action.item()))
-                log_probs.append(log_prob)
-                values.append(value)
-                rewards.append(torch.tensor(reward, dtype=torch.float32, device=device))
-                entropies.append(dist.entropy())
+                
+                # Store experience for PPO
+                class_states.append(state.copy())
+                class_actions.append(int(action.item()))
+                class_old_log_probs.append(log_prob.item())
+                class_rewards.append(float(reward))
+                class_values.append(value.item())
+                class_dones.append(bool(done))
+                class_entropies.append(dist.entropy().item())
+                
                 episode_drifts.append(info.get("drift", 0.0))
                 episode_prec_cov.append((info.get("precision", 0.0), info.get("coverage", 0.0), info.get("hard_precision", 0.0)))
-                # Accumulate reward components (approximate by re-deriving parts from info and previous metrics is costly;
-                # instead log available signals)
+                # Accumulate reward components
                 comp_sums["prec_gain"] += float(info.get("precision", 0.0))
                 comp_sums["cov_gain"] += float(info.get("coverage", 0.0))
                 comp_sums["drift_pen"] += float(info.get("drift", 0.0))
@@ -931,6 +989,17 @@ def train_dynamic_anchors(
                 state = next_state
                 if done:
                     break
+
+            # Append class experiences to global batch
+            all_states.extend(class_states)
+            all_actions.extend(class_actions)
+            all_old_log_probs.extend(class_old_log_probs)
+            all_rewards.extend(class_rewards)
+            all_values.extend(class_values)
+            all_dones.extend(class_dones)
+            all_entropies.extend(class_entropies)
+            
+            total_return += sum(class_rewards) if class_rewards else 0.0
 
             # Per-class precision/coverage logging (track last info for this class)
             last_info_for_cls = info if 'info' in locals() else {}
@@ -1022,33 +1091,117 @@ def train_dynamic_anchors(
             })
             per_class_box_history[cls].append((env.lower.copy(), env.upper.copy()))
 
-            # Advantage with value baseline and entropy bonus (standardized advantages)
-            policy_opt.zero_grad()
-            R = torch.zeros(1, dtype=torch.float32, device=device)
+        # PPO: Compute returns and advantages for collected batch
+        if len(all_rewards) > 0:
+            # Compute discounted returns
             returns = []
-            for t in reversed(range(len(rewards))):
-                R = rewards[t] + gamma * R
+            R = 0.0
+            for i in reversed(range(len(all_rewards))):
+                if all_dones[i]:
+                    R = 0.0
+                R = all_rewards[i] + gamma * R
                 returns.insert(0, R)
-            if returns:
-                returns_t = torch.stack(returns).detach()
-                values_t = torch.stack(values).squeeze(-1)
-                advantages = returns_t - values_t
-                # Standardize
-                adv_mean = advantages.mean()
-                adv_std = advantages.std(unbiased=False) + 1e-8
-                advantages = (advantages - adv_mean) / adv_std
-                policy_loss = -(torch.stack(log_probs) * advantages.detach()).sum()
-                value_loss = 0.5 * (advantages.pow(2)).sum()
-                entropy_term = -entropy_coef * torch.stack(entropies).sum()
-                loss = policy_loss + value_coef * value_loss + entropy_term
-            else:
-                loss = torch.zeros(1, dtype=torch.float32, device=device)
-            loss.backward()
-            # Gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(list(policy.parameters()) + list(value_fn.parameters()), max_norm=0.5)
-            policy_opt.step()
-
-            total_return += float(torch.stack(rewards).sum().item()) if rewards else 0.0
+            
+            returns_t = torch.tensor(returns, dtype=torch.float32, device=device)
+            values_t = torch.tensor(all_values, dtype=torch.float32, device=device)
+            advantages = returns_t - values_t
+            
+            # Standardize advantages
+            adv_mean = advantages.mean()
+            adv_std = advantages.std(unbiased=False) + 1e-8
+            advantages = (advantages - adv_mean) / adv_std
+            
+            # Convert to tensors
+            states_t = torch.tensor(np.array(all_states), dtype=torch.float32, device=device)
+            actions_t = torch.tensor(all_actions, dtype=torch.long, device=device)
+            old_log_probs_t = torch.tensor(all_old_log_probs, dtype=torch.float32, device=device)
+            old_values_t = values_t.clone().detach()
+            
+            # PPO: Multiple update epochs
+            for ppo_epoch in range(ppo_epochs):
+                policy_opt.zero_grad()
+                
+                # Create batches if batch_size is specified
+                if batch_size is not None and batch_size < len(states_t):
+                    indices = torch.randperm(len(states_t), device=device)
+                    total_loss = 0.0
+                    n_batches = 0
+                    
+                    for batch_start in range(0, len(states_t), batch_size):
+                        batch_end = min(batch_start + batch_size, len(states_t))
+                        batch_indices = indices[batch_start:batch_end]
+                        
+                        batch_states = states_t[batch_indices]
+                        batch_actions = actions_t[batch_indices]
+                        batch_old_log_probs = old_log_probs_t[batch_indices]
+                        batch_advantages = advantages[batch_indices]
+                        batch_returns = returns_t[batch_indices]
+                        batch_old_values = old_values_t[batch_indices]
+                        
+                        # Re-evaluate policy and value on batch states
+                        logits = policy(batch_states)
+                        probs_pi = torch.softmax(logits, dim=-1)
+                        dist = torch.distributions.Categorical(probs_pi)
+                        new_log_probs = dist.log_prob(batch_actions)
+                        new_values = value_fn(batch_states)
+                        entropy = dist.entropy().mean()
+                        
+                        # Importance sampling ratio
+                        ratio = torch.exp(new_log_probs - batch_old_log_probs)
+                        
+                        # Clipped policy loss
+                        surr1 = ratio * batch_advantages
+                        surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * batch_advantages
+                        policy_loss = -torch.min(surr1, surr2).mean()
+                        
+                        # Value loss (MSE between new values and returns)
+                        value_loss = 0.5 * (new_values - batch_returns).pow(2).mean()
+                        
+                        # Entropy bonus
+                        entropy_term = -entropy_coef * entropy
+                        
+                        # Total loss
+                        loss = policy_loss + value_coef * value_loss + entropy_term
+                        loss.backward()
+                        
+                        total_loss += loss.item()
+                        n_batches += 1
+                    
+                    # Gradient clipping and update
+                    torch.nn.utils.clip_grad_norm_(list(policy.parameters()) + list(value_fn.parameters()), max_norm=0.5)
+                    policy_opt.step()
+                    
+                else:
+                    # Use all experiences as one batch
+                    # Re-evaluate policy and value on collected states
+                    logits = policy(states_t)
+                    probs_pi = torch.softmax(logits, dim=-1)
+                    dist = torch.distributions.Categorical(probs_pi)
+                    new_log_probs = dist.log_prob(actions_t)
+                    new_values = value_fn(states_t)
+                    entropy = dist.entropy().mean()
+                    
+                    # Importance sampling ratio
+                    ratio = torch.exp(new_log_probs - old_log_probs_t)
+                    
+                    # Clipped policy loss
+                    surr1 = ratio * advantages
+                    surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * advantages
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    
+                    # Value loss (MSE between new values and returns)
+                    value_loss = 0.5 * (new_values - returns_t).pow(2).mean()
+                    
+                    # Entropy bonus
+                    entropy_term = -entropy_coef * entropy
+                    
+                    # Total loss
+                    loss = policy_loss + value_coef * value_loss + entropy_term
+                    loss.backward()
+                    
+                    # Gradient clipping and update
+                    torch.nn.utils.clip_grad_norm_(list(policy.parameters()) + list(value_fn.parameters()), max_norm=0.5)
+                    policy_opt.step()
 
         # Save box history for visualization (use last env as representative) and logs
         last_env = next(reversed(envs.values()))
@@ -1525,7 +1678,6 @@ def train_dynamic_anchors(
     else:
         plt.close(fig)
 
-    # Return models for saving externally
     return {
         "classifier": classifier,  # PyTorch model - should be saved separately
         "policy": policy,  # PyTorch model - should be saved separately
@@ -1582,7 +1734,6 @@ def load_trained_models(
         dict with keys: "classifier", "policy", "value_fn", "metadata", "scaler"
     """
     import json
-    import pickle
     from sklearn.preprocessing import StandardScaler
     
     # Load metadata from results file
@@ -1692,8 +1843,6 @@ def explain_instance(
         bin_edges = metadata.get("bin_edges")
         if bin_edges:
             bin_edges = [np.array(e, dtype=np.float32) for e in bin_edges]
-            # Recreate bin representatives from training data (approximate)
-            # For proper explanation, we'd need the original training data
             X_bins_instance = discretize_by_edges(X_instance_std.reshape(1, -1), bin_edges)[0]
             # Use simplified bin reps (median of bin)
             bin_reps = []
@@ -1922,8 +2071,12 @@ if __name__ == "__main__":
     parser.add_argument("--show_plots", action="store_true", default=True, help="Enable visualization plots (default: True)")
     parser.add_argument("--no-plots", dest="show_plots", action="store_false", help="Disable visualization plots")
     parser.add_argument("--max_features_in_rule", type=int, default=5, help="Maximum number of features to show in anchor rules (default: 5, use 0 for all features)")
-    parser.add_argument("--num_greedy_rollouts", type=int, default=1, help="Number of greedy rollouts per test instance (default: 1, currently always 1 per instance)")
+    parser.add_argument("--num_greedy_rollouts", type=int, default=20, help="Number of greedy rollouts per test instance (default: 20)")
     parser.add_argument("--num_test_instances", type=parse_nullable_int, default=None, help="Number of test instances per class to evaluate (None=use num_greedy_rollouts if >1, else default to 20)")
+    # PPO-specific arguments
+    parser.add_argument("--ppo_epochs", type=int, default=None, help="PPO: number of update epochs per batch (None=use dataset default)")
+    parser.add_argument("--clip_epsilon", type=float, default=None, help="PPO: clipping parameter epsilon (None=use dataset default)")
+    parser.add_argument("--batch_size", type=int, default=None, help="PPO: batch size for updates (None=use all experiences)")
 
     args = parser.parse_args()
 
@@ -1944,6 +2097,9 @@ if __name__ == "__main__":
         max_features_in_rule=args.max_features_in_rule,
         num_greedy_rollouts=args.num_greedy_rollouts,
         num_test_instances_per_class=args.num_test_instances,
+        ppo_epochs=args.ppo_epochs,
+        clip_epsilon=args.clip_epsilon,
+        batch_size=args.batch_size,
     )
 
     import json
@@ -1973,7 +2129,7 @@ if __name__ == "__main__":
     value_model = results.pop('value_fn', None) if 'value_fn' in results else None
 
     # Save models separately
-    model_prefix = f'{args.dataset}_{args.episodes}_{args.steps}_{args.classifier_epochs}_{args.reg_lambda}_{args.seed}_{args.device}_{args.use_perturbation}_{args.perturbation_mode}_{args.n_perturb}_{args.local_instance_index}_{args.initial_window}_{args.show_plots}_{args.max_features_in_rule}'
+    model_prefix = f'ppo_{args.dataset}_{args.episodes}_{args.steps}_{args.classifier_epochs}_{args.reg_lambda}_{args.seed}_{args.device}_{args.use_perturbation}_{args.perturbation_mode}_{args.n_perturb}_{args.local_instance_index}_{args.initial_window}_{args.show_plots}_{args.max_features_in_rule}_{args.ppo_epochs or "default"}_{args.clip_epsilon or "default"}_{args.batch_size or "all"}'
     if classifier_model is not None:
         classifier_file = f'classifier_{model_prefix}.pth'
         torch.save(classifier_model.state_dict(), classifier_file)
