@@ -8,7 +8,6 @@ from datasets import Dataset, DatasetDict, Image, Features, Value
 from huggingface_hub import login, HfApi
 import glob
 
-HF_WRITE_TOKEN = "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"
 
 def read_and_push_to_hub(
     data_dir: str = "./data_all_images",
